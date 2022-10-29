@@ -373,6 +373,7 @@ struct qseecom_client_handle {
 	bool from_smcinvoke;
 	struct qtee_shm shm; /* kernel client's shm for req/rsp buf */
 	bool unload_pending;
+	bool from_loadapp;
 };
 
 struct qseecom_listener_handle {
@@ -2300,8 +2301,9 @@ static int __qseecom_process_reentrancy_blocked_on_listener(
 
 	/* find app_id & img_name from list */
 	if (!ptr_app) {
-		if (data->client.from_smcinvoke) {
-			pr_debug("This request is from smcinvoke\n");
+		if (data->client.from_smcinvoke || data->client.from_loadapp) {
+			pr_err("This request is from %s\n",
+				(data->client.from_smcinvoke ? "smcinvoke" : "load_app"));
 			ptr_app = &dummy_app_entry;
 			ptr_app->app_id = data->client.app_id;
 		} else {
@@ -2379,6 +2381,11 @@ static int __qseecom_process_reentrancy_blocked_on_listener(
 		ret = qseecom_scm_call(SCM_SVC_TZSCHEDULER, 1,
 					&ireq, sizeof(ireq),
 					&continue_resp, sizeof(continue_resp));
+
+		if (ret) {
+			pr_err("never expected falling to legacy method\n");
+		}
+
 		if (ret && qseecom.smcinvoke_support) {
 			/* retry with legacy cmd */
 			qseecom.smcinvoke_support = false;
@@ -2398,7 +2405,7 @@ static int __qseecom_process_reentrancy_blocked_on_listener(
 		resp->result = continue_resp.result;
 		resp->resp_type = continue_resp.resp_type;
 		resp->data = continue_resp.data;
-		pr_debug("unblock resp = %d\n", resp->result);
+		pr_err("unblock resp = %d\n", resp->result);
 	} while (resp->result == QSEOS_RESULT_BLOCKED_ON_LISTENER);
 
 	if (resp->result != QSEOS_RESULT_INCOMPLETE) {
@@ -2894,24 +2901,42 @@ static int qseecom_load_app(struct qseecom_dev_handle *data, void __user *argp)
 			goto loadapp_err;
 		}
 
-		if (resp.result == QSEOS_RESULT_FAILURE) {
-			pr_err("scm_call rsp.result is QSEOS_RESULT_FAILURE\n");
-			ret = -EFAULT;
-			goto loadapp_err;
-		}
-
-		if (resp.result == QSEOS_RESULT_INCOMPLETE) {
-			ret = __qseecom_process_incomplete_cmd(data, &resp);
-			if (ret) {
-				/* TZ has created app_id, need to unload it */
-				pr_err("incomp_cmd err %d, %d, unload %d %s\n",
-					ret, resp.result, resp.data,
-					load_img_req.img_name);
-				__qseecom_unload_app(data, resp.data);
+		do {
+			if (resp.result == QSEOS_RESULT_FAILURE) {
+				pr_err("scm_call rsp.result is QSEOS_RESULT_FAILURE\n");
 				ret = -EFAULT;
 				goto loadapp_err;
 			}
-		}
+
+			if (resp.result == QSEOS_RESULT_INCOMPLETE) {
+				ret = __qseecom_process_incomplete_cmd(data, &resp);
+				if (ret) {
+					/* TZ has created app_id, need to unload it */
+					pr_err("incomp_cmd err %d, %d, unload %d %s\n",
+						ret, resp.result, resp.data,
+						load_img_req.img_name);
+					__qseecom_unload_app(data, resp.data);
+					ret = -EFAULT;
+					goto loadapp_err;
+				}
+			}
+
+			if (resp.result == QSEOS_RESULT_BLOCKED_ON_LISTENER) {
+				pr_err("load app blocked on listener\n");
+				data->client.app_id = resp.result;
+				data->client.from_loadapp = true;
+				ret = __qseecom_process_reentrancy_blocked_on_listener(&resp,
+					NULL, data);
+				if (ret) {
+					pr_err("load app fail proc block on listener,ret :%d\n",
+						ret);
+					ret = -EFAULT;
+					goto loadapp_err;
+				}
+			}
+
+		} while ((resp.result == QSEOS_RESULT_BLOCKED_ON_LISTENER) ||
+			(resp.result == QSEOS_RESULT_INCOMPLETE));
 
 		if (resp.result != QSEOS_RESULT_SUCCESS) {
 			pr_err("scm_call failed resp.result unknown, %d\n",
@@ -3021,7 +3046,6 @@ static int __qseecom_unload_app(struct qseecom_dev_handle *data,
 	/* Populate the structure for sending scm call to load image */
 	req.qsee_cmd_id = QSEOS_APP_SHUTDOWN_COMMAND;
 	req.app_id = app_id;
-
 	/* SCM_CALL to unload the app */
 	ret = qseecom_scm_call(SCM_SVC_TZSCHEDULER, 1, &req,
 			sizeof(struct qseecom_unload_app_ireq),
@@ -3031,31 +3055,43 @@ static int __qseecom_unload_app(struct qseecom_dev_handle *data,
 			app_id, ret);
 		return ret;
 	}
-	switch (resp.result) {
-	case QSEOS_RESULT_SUCCESS:
-		pr_warn("App (%d) is unloaded\n", app_id);
-		break;
-	case QSEOS_RESULT_INCOMPLETE:
-		ret = __qseecom_process_incomplete_cmd(data, &resp);
-		if (ret)
-			pr_err("unload app %d fail proc incom cmd: %d,%d,%d\n",
-				app_id, ret, resp.result, resp.data);
-		else
+
+	do {
+		switch (resp.result) {
+		case QSEOS_RESULT_SUCCESS:
 			pr_warn("App (%d) is unloaded\n", app_id);
-		break;
-	case QSEOS_RESULT_FAILURE:
-		pr_err("app (%d) unload_failed!!\n", app_id);
-		ret = -EFAULT;
-		break;
-	default:
-		pr_err("unload app %d get unknown resp.result %d\n",
-				app_id, resp.result);
-		ret = -EFAULT;
-		break;
-	}
+			break;
+		case QSEOS_RESULT_INCOMPLETE:
+			ret = __qseecom_process_incomplete_cmd(data, &resp);
+			if (ret)
+				pr_err("unload app %d fail proc incom cmd: %d,%d,%d\n",
+					app_id, ret, resp.result, resp.data);
+			else
+				pr_warn("App (%d) is unloaded\n", app_id);
+			break;
+		case QSEOS_RESULT_FAILURE:
+			pr_err("app (%d) unload_failed!!\n", app_id);
+			ret = -EFAULT;
+			break;
+		case QSEOS_RESULT_BLOCKED_ON_LISTENER:
+			pr_err("unload app (%d) blocked on listener\n", app_id);
+			ret = __qseecom_process_reentrancy_blocked_on_listener(&resp, NULL, data);
+			if (ret) {
+				pr_err("unload app fail proc block on listener cmd,ret :%d\n",
+					ret);
+				ret = -EFAULT;
+			}
+			break;
+		default:
+			pr_err("unload app %d get unknown resp.result %d\n",
+					app_id, resp.result);
+			ret = -EFAULT;
+			break;
+		}
+	} while ((resp.result == QSEOS_RESULT_INCOMPLETE) ||
+			(resp.result == QSEOS_RESULT_BLOCKED_ON_LISTENER));
 	return ret;
 }
-
 static int qseecom_unload_app(struct qseecom_dev_handle *data,
 				bool app_crash)
 {
@@ -3069,11 +3105,21 @@ static int qseecom_unload_app(struct qseecom_dev_handle *data,
 		return -EINVAL;
 	}
 
-	pr_err("unload app %d(%s), app_crash flag %d\n", data->client.app_id,
+	pr_debug("unload app %d(%s), app_crash flag %d\n", data->client.app_id,
 			data->client.app_name, app_crash);
 
 	if (!memcmp(data->client.app_name, "keymaste", strlen("keymaste"))) {
 		pr_debug("Do not unload keymaster app from tz\n");
+		goto unload_exit;
+	}
+
+	if (!memcmp(data->client.app_name, "tz_iccc", strlen("tz_iccc"))) {
+		pr_debug("Do not unload tz_iccc app from tz\n");
+		goto unload_exit;
+	}
+
+	if (!memcmp(data->client.app_name, "tz_hdm", strlen("tz_hdm"))) {
+		pr_debug("Do not unload tz_hdm app from tz\n");
 		goto unload_exit;
 	}
 
@@ -3118,12 +3164,10 @@ static int qseecom_unload_app(struct qseecom_dev_handle *data,
 			 * If unload failed due to EBUSY, don't free mem
 			 * just restore app ref_cnt and return -EBUSY
 			 */
-			pr_err("unload ta %d(%s) EBUSY\n",
+			pr_warn("unload ta %d(%s) EBUSY\n",
 				data->client.app_id, data->client.app_name);
 			ptr_app->ref_cnt++;
 			return ret;
-		} else {
-			pr_err("__qseecom_unload_app %d succeeded\n", data->client.app_id);
 		}
 		spin_lock_irqsave(&qseecom.registered_app_list_lock, flags);
 		list_del(&ptr_app->list);
@@ -3159,7 +3203,7 @@ static int qseecom_prepare_unload_app(struct qseecom_dev_handle *data)
 	list_add_tail(&entry->list,
 		&qseecom.unload_app_pending_list_head);
 	data->client.unload_pending = true;
-	pr_err("unload ta %d pending\n", data->client.app_id);
+	pr_debug("unload ta %d pending\n", data->client.app_id);
 	return 0;
 }
 
@@ -3200,7 +3244,7 @@ static void __qseecom_processing_pending_unload_app(void)
 		entry = list_entry(pos,
 			struct qseecom_unload_app_pending_list, list);
 		if (entry && entry->data) {
-			pr_err("process pending unload app %d (%s)\n",
+			pr_debug("process pending unload app %d (%s)\n",
 				entry->data->client.app_id,
 				entry->data->client.app_name);
 			mutex_unlock(&unload_app_pending_list_lock);
@@ -3209,8 +3253,6 @@ static void __qseecom_processing_pending_unload_app(void)
 			if (ret)
 				pr_err("unload app %d pending failed %d\n",
 					entry->data->client.app_id, ret);
-			else
-				pr_err("unload app %d has succeeded\n", entry->data->client.app_id);
 			mutex_unlock(&app_access_lock);
 			mutex_lock(&unload_app_pending_list_lock);
 			__qseecom_free_tzbuf(&entry->data->sglistinfo_shm);
@@ -3229,7 +3271,7 @@ static int __qseecom_unload_app_kthread_func(void *data)
 			qseecom.unload_app_kthread_wq,
 			atomic_read(&qseecom.unload_app_kthread_state)
 				== UNLOAD_APP_KT_WAKEUP);
-		pr_err("kthread to unload app is called, state %d\n",
+		pr_debug("kthread to unload app is called, state %d\n",
 			atomic_read(&qseecom.unload_app_kthread_state));
 		__qseecom_processing_pending_unload_app();
 		atomic_set(&qseecom.unload_app_kthread_state,
@@ -5185,7 +5227,6 @@ int qseecom_shutdown_app(struct qseecom_handle **handle)
 	else
 		ret = qseecom_unload_app(data, false);
 
-	pr_err("After qseecom_unload_app, ret : %d\n", ret);
 	mutex_unlock(&app_access_lock);
 	if (ret == 0) {
 		if (data->client.sb_virt)
@@ -7818,7 +7859,6 @@ long qseecom_ioctl(struct file *file,
 		mutex_lock(&app_access_lock);
 		atomic_inc(&data->ioctl_count);
 		ret = qseecom_unload_app(data, false);
-		pr_err("qseecom_unload_app, ret :%d\n", ret);
 		atomic_dec(&data->ioctl_count);
 		mutex_unlock(&app_access_lock);
 		if (ret)
@@ -8327,7 +8367,7 @@ static int qseecom_release(struct inode *inode, struct file *file)
 
 	__qseecom_release_disable_clk(data);
 	if (!data->released) {
-		pr_err("data: released=false, type=%d, mode=%d, data=0x%pK\n",
+		pr_debug("data: released=false, type=%d, mode=%d, data=0x%pK\n",
 			data->type, data->mode, data);
 		switch (data->type) {
 		case QSEECOM_LISTENER_SERVICE:
@@ -8341,7 +8381,7 @@ static int qseecom_release(struct inode *inode, struct file *file)
 			__wakeup_unregister_listener_kthread();
 			break;
 		case QSEECOM_CLIENT_APP:
-			pr_err("release app %d (%s)\n",
+			pr_debug("release app %d (%s)\n",
 				data->client.app_id, data->client.app_name);
 			if (data->client.app_id) {
 				free_private_data = false;

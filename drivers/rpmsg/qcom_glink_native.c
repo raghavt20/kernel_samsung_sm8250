@@ -24,10 +24,19 @@
 #include <linux/mailbox_client.h>
 #include <linux/ipc_logging.h>
 #include <linux/suspend.h>
+#if IS_ENABLED(CONFIG_SSC_WAKEUP_DEBUG)
+#include <linux/time.h>
+#include <linux/ktime.h>
+#include <linux/time64.h>
+#endif
 #include <soc/qcom/subsystem_notif.h>
 
 #include "rpmsg_internal.h"
 #include "qcom_glink_native.h"
+
+#if IS_ENABLED(CONFIG_SEC_PM)
+#include <linux/wakeup_reason.h>
+#endif
 
 #define GLINK_LOG_PAGE_CNT 2
 #define GLINK_INFO(ctxt, x, ...)					  \
@@ -1252,6 +1261,11 @@ static int qcom_glink_handle_signals(struct qcom_glink *glink,
 	return 0;
 }
 
+#if IS_ENABLED(CONFIG_SSC_WAKEUP_DEBUG)
+#define MAX_TS_ARR_SIZE	3
+struct timespec64 slpi_wakeup_ts[MAX_TS_ARR_SIZE];
+static int slpi_wakeup_ts_idx;
+#endif
 static int qcom_glink_native_rx(struct qcom_glink *glink, int iterations)
 {
 	struct glink_msg msg;
@@ -1273,9 +1287,32 @@ static int qcom_glink_native_rx(struct qcom_glink *glink, int iterations)
 
 	if (should_wake) {
 		pr_info("%s: wakeup %s\n", __func__, glink->irqname);
+#if IS_ENABLED(CONFIG_SEC_PM)
+		log_threaded_irq_wakeup_reason(glink->irq, -1);
+#endif
 		glink_resume_pkt = true;
 		should_wake = false;
 		pm_system_wakeup();
+#if IS_ENABLED(CONFIG_SSC_WAKEUP_DEBUG)
+		if (!strcmp(glink->irqname, "glink-native-slpi")) {
+			int curr_idx = slpi_wakeup_ts_idx;
+			int prev_idx = (curr_idx >= MAX_TS_ARR_SIZE - 1) ?
+					(0) : (curr_idx + 1);
+			
+			slpi_wakeup_ts[slpi_wakeup_ts_idx++] = 
+				ktime_to_timespec64(ktime_get_boottime());
+
+			if (slpi_wakeup_ts_idx >= MAX_TS_ARR_SIZE)
+				slpi_wakeup_ts_idx = 0;
+			if (slpi_wakeup_ts[curr_idx].tv_sec != 0
+				&& slpi_wakeup_ts[prev_idx].tv_sec != 0 
+				&& (slpi_wakeup_ts[curr_idx].tv_sec == 
+					slpi_wakeup_ts[prev_idx].tv_sec)) {
+				pr_info("frequent AP wakeup due to slpi\n");
+				panic("force crash:frequent AP wakeup due to slpi\n");
+			}
+		}
+#endif
 	}
 	/* To wakeup any blocking writers */
 	wake_up_all(&glink->tx_avail_notify);
@@ -2141,14 +2178,15 @@ struct qcom_glink *qcom_glink_native_probe(struct device *dev,
 					   bool intentless)
 {
 	struct qcom_glink *glink;
-	u32 *arr;
-	int size;
-	int irq;
 	int ret;
 
 	glink = devm_kzalloc(dev, sizeof(*glink), GFP_KERNEL);
-	if (!glink)
+	if (!glink) {
+		pr_err("QCT [%s] no mem for %s\n", __func__, dev_name(dev));
 		return ERR_PTR(-ENOMEM);
+	}
+
+	pr_err("QCT [%s] %s, edge:%px\n", __func__, dev_name(dev), glink);
 
 	glink->dev = dev;
 	glink->dev->groups = qcom_glink_groups;
@@ -2200,6 +2238,20 @@ struct qcom_glink *qcom_glink_native_probe(struct device *dev,
 
 	snprintf(glink->irqname, 32, "glink-native-%s", glink->name);
 
+	glink->ilc = ipc_log_context_create(GLINK_LOG_PAGE_CNT, glink->name, 0);
+
+	return glink;
+}
+EXPORT_SYMBOL(qcom_glink_native_probe);
+
+int qcom_glink_native_start(struct qcom_glink *glink)
+{
+	struct device *dev = glink->dev;
+	u32 *arr;
+	int size;
+	int irq;
+	int ret;
+
 	spin_lock_init(&glink->irq_lock);
 	glink->irq_running = false;
 
@@ -2210,37 +2262,24 @@ struct qcom_glink *qcom_glink_native_probe(struct device *dev,
 					IRQF_NO_SUSPEND | IRQF_ONESHOT,
 					glink->irqname, glink);
 	if (ret) {
-		dev_err(dev, "failed to request IRQ\n");
-		return ERR_PTR(ret);
+		dev_err(dev, "failed to request IRQ with %d\n", ret);
+		return ret;
 	}
 
 	glink->irq = irq;
-	disable_irq(glink->irq);
 
 	size = of_property_count_u32_elems(dev->of_node, "cpu-affinity");
 	if (size > 0) {
 		arr = kmalloc_array(size, sizeof(u32), GFP_KERNEL);
-		if (!arr) {
-			ret = -ENOMEM;
-			return ERR_PTR(ret);
-		}
+		if (!arr)
+			return -ENOMEM;
+
 		ret = of_property_read_u32_array(dev->of_node, "cpu-affinity",
 						 arr, size);
 		if (!ret)
 			qcom_glink_set_affinity(glink, arr, size);
 		kfree(arr);
 	}
-	glink->ilc = ipc_log_context_create(GLINK_LOG_PAGE_CNT, glink->name, 0);
-
-	return glink;
-}
-EXPORT_SYMBOL(qcom_glink_native_probe);
-
-int qcom_glink_native_start(struct qcom_glink *glink)
-{
-	int ret;
-
-	enable_irq(glink->irq);
 
 	ret = qcom_glink_send_version(glink);
 	if (ret) {
@@ -2268,6 +2307,8 @@ void qcom_glink_native_remove(struct qcom_glink *glink)
 	struct glink_channel *channel;
 	int cid;
 	int ret;
+
+	pr_err("QCT [%s] %s, edge:%px\n", __func__, dev_name(glink->dev), glink);
 
 	qcom_glink_notif_reset(glink);
 	disable_irq(glink->irq);
